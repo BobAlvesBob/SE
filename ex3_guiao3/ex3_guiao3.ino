@@ -1,6 +1,7 @@
 /**
  * Controle da Comporta com Leitura Contínua e Mensagem de Erro
  * Sistema de Represa para Peixes
+ * Com função de emergência por botão
  */
 
 #include <Stepper.h>
@@ -21,11 +22,15 @@
 #define MOTOR_PIN3 5
 #define MOTOR_PIN4 6
 
-// Pinos dos LEDs
+// NOVOS PINOS PARA BOTÃO E BUZZER
+#define PUSH_BUTTON_PIN 8    // Pino do pushbutton
+#define BUZZER_PIN 3         // Pino do buzzer
+
+// Pinos dos LEDs (AJUSTADO para resolver conflito com o botão)
 #define LED1 A2
 #define LED2 A3
 #define LED3 7
-#define LED4 8
+#define LED4 10              // Alterado de 8 para 10 para evitar conflito com o botão
 #define LED5 9
 #define LED6 13
 #define LED7 A4
@@ -39,6 +44,7 @@
 #define HEIGHT_PER_LED 12.5            // Altura por LED (100/8 cm)
 #define LCD_ADDRESS 0x27               // Endereço I2C do LCD
 #define MIN_SAFE_DISTANCE 10.0         // Distância mínima de segurança (10 cm)
+#define EMERGENCY_DURATION 1000        // Duração da emergência em milissegundos (1 segundo)
 
 // Objetos
 Stepper stepperMotor(STEPS_PER_REVOLUTION, MOTOR_PIN1, MOTOR_PIN3, MOTOR_PIN2, MOTOR_PIN4);
@@ -51,10 +57,13 @@ int ledPins[] = {LED1, LED2, LED3, LED4, LED5, LED6, LED7, LED8};
 bool errorState = false;               // Indica se há um erro de altura excedida
 unsigned long lastJoystickRead = 0;    // Última leitura do joystick
 unsigned long lastDisplayUpdate = 0;   // Última atualização do display
+unsigned long lastButtonTime = 0;      // Para debounce do botão
+bool emergencyActive = false;          // Indica se emergência está ativa
+unsigned long emergencyStartTime = 0;  // Tempo de início da emergência
 
 void setup() {
   Serial.begin(9600);
-  Serial.println("Sistema de Controle da Comporta - Leitura Contínua");
+  Serial.println("Sistema de Controle da Comporta - Com Emergência");
   
   // Inicializa pinos do ultrassom
   pinMode(TRIGGER_PIN, OUTPUT);
@@ -64,6 +73,11 @@ void setup() {
   for (int i = 0; i < 8; i++) {
     pinMode(ledPins[i], OUTPUT);
   }
+  
+  // NOVAS INICIALIZAÇÕES
+  pinMode(PUSH_BUTTON_PIN, INPUT_PULLUP);  // Botão com resistor pull-up
+  pinMode(BUZZER_PIN, OUTPUT);             // Buzzer como saída
+  digitalWrite(BUZZER_PIN, LOW);           // Garante que o buzzer comece desligado
   
   // Inicializa o LCD
   lcd.init();
@@ -86,13 +100,24 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
   
-  // Lê o sensor ultrassônico CONTINUAMENTE
-  readUltrasonicSensor();
+  // VERIFICA O BOTÃO DE EMERGÊNCIA (com debounce)
+  if (!emergencyActive && digitalRead(PUSH_BUTTON_PIN) == LOW && currentMillis - lastButtonTime > 200) {
+    lastButtonTime = currentMillis;
+    activateEmergency();
+  }
   
-  // Lê o joystick e controla o motor
-  if (currentMillis - lastJoystickRead >= 100) {
-    handleJoystick();
-    lastJoystickRead = currentMillis;
+  // PROCESSA A EMERGÊNCIA SE ESTIVER ATIVA
+  if (emergencyActive) {
+    handleEmergency(currentMillis);
+  } else {
+    // Lê o sensor ultrassônico CONTINUAMENTE
+    readUltrasonicSensor();
+    
+    // Lê o joystick e controla o motor
+    if (currentMillis - lastJoystickRead >= 100) {
+      handleJoystick();
+      lastJoystickRead = currentMillis;
+    }
   }
   
   // Atualiza os LEDs continuamente com base na altura calculada
@@ -103,6 +128,48 @@ void loop() {
     updateDisplay();
     lastDisplayUpdate = currentMillis;
   }
+}
+
+// NOVA FUNÇÃO: Ativa o modo de emergência
+void activateEmergency() {
+  emergencyActive = true;
+  emergencyStartTime = millis();
+  
+  Serial.println("EMERGÊNCIA: Abrindo comporta!");
+  
+  // Atualiza o display para mostrar EMERGÊNCIA
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("EMERGENCIA");
+  lcd.setCursor(0, 1);
+  lcd.print("Abrindo comporta!");
+  
+  // Liga o buzzer
+  digitalWrite(BUZZER_PIN, HIGH);
+}
+
+// NOVA FUNÇÃO: Processa o estado de emergência
+void handleEmergency(unsigned long currentTime) {
+  // Se o tempo de emergência acabou
+  if (currentTime - emergencyStartTime >= EMERGENCY_DURATION) {
+    // Desliga o buzzer
+    digitalWrite(BUZZER_PIN, LOW);
+    
+    // Atualiza o estado da comporta após a emergência
+    readUltrasonicSensor();
+    
+    // Finaliza o estado de emergência
+    emergencyActive = false;
+    
+    // Retorna à exibição normal
+    updateDisplay();
+    
+    Serial.println("Emergência finalizada");
+    return;
+  }
+  
+  // Durante a emergência, move o motor para abrir a comporta
+  stepperMotor.step(-5);  // Move pequenos passos continuamente para abrir
 }
 
 // Lê o sensor ultrassônico e calcula a altura da comporta
@@ -194,9 +261,9 @@ void handleJoystick() {
 
 // Atualiza os LEDs para mostrar a altura da comporta
 void updateLEDs() {
-  // Se estiver em estado de erro, pisque todos os LEDs
-  if (errorState) {
-    // Faz os LEDs piscarem para indicar erro
+  // Se estiver em estado de erro ou emergência, pisque todos os LEDs
+  if (errorState || emergencyActive) {
+    // Faz os LEDs piscarem para indicar erro/emergência
     if ((millis() / 500) % 2 == 0) {
       for (int i = 0; i < 8; i++) {
         digitalWrite(ledPins[i], HIGH);
@@ -225,6 +292,11 @@ void updateLEDs() {
 
 // Atualiza o display LCD
 void updateDisplay() {
+  // Se estiver em emergência, não atualiza o display aqui
+  if (emergencyActive) {
+    return;
+  }
+  
   // Limpa a linha
   lcd.setCursor(0, 1);
   lcd.print("                ");
