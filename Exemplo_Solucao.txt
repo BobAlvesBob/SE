@@ -1,0 +1,151 @@
+; ------------------------------------------------------------------------
+; Incluir definições do AVR
+#include "avr/io.h"
+
+; ------------------------------------------------------------------------
+; Tornar as funções visíveis fora deste arquivo
+.global configure
+.global cycle
+
+; ------------------------------------------------------------------------
+; Precisamos de uma variável para armazenar o sentido atual do motor
+; 0 => girar para a esquerda
+; 1 => girar para a direita
+
+; Definimos uma seção de dados (bss) para a variável 'direction'
+.section .bss
+direction:
+  .byte 1
+
+; ------------------------------------------------------------------------
+; Seção de texto (código)
+.section .text
+
+; =========================================================================
+; Função: configure()
+;  - Configura os registradores de Data Direction (DDR) e eventualmente
+;    os pull-ups necessários.
+; =========================================================================
+configure:
+    ; -------------------------
+    ; Configurar PB0, PB1, PB5 como saída (1) e PB4 como entrada (0).
+    ; DDRB => Data Direction Register B
+    ; PB0 = bit 0
+    ; PB1 = bit 1
+    ; PB4 = bit 4
+    ; PB5 = bit 5
+
+    ; Ler DDRB no registrador temporário r16
+    in    r16, DDRB
+    ; Setar bits 0,1,5 como saída (1)
+    sbr   r16, (1<<PB0)|(1<<PB1)|(1<<PB5)
+    ; Limpar bit 4 para entrada (se não estiver limpo)
+    cbr   r16, (1<<PB4)
+    ; Escrever de volta em DDRB
+    out   DDRB, r16
+
+    ; -------------------------
+    ; Ativar pull-up interno em PB4 (opcional, se o HW exigir).
+    ; Para isso, PORTB bit4 deve ser 1 se queremos pull-up.
+    in    r16, PORTB
+    sbr   r16, (1<<PB4)
+    out   PORTB, r16
+
+    ; -------------------------
+    ; Configurar PD7 como entrada (0).
+    ; DDRD => Data Direction Register D
+    in    r16, DDRD
+    cbr   r16, (1<<PD7) ; limpa bit7 para entrada
+    out   DDRD, r16
+
+    ; -------------------------
+    ; Ativar pull-up em PD7 (se necessário).
+    in    r16, PORTD
+    sbr   r16, (1<<PD7)
+    out   PORTD, r16
+
+    ; -------------------------
+    ; Inicialmente, vamos colocar a direção = 1 (girar para a direita)
+    ldi   r17, 1
+    sts   direction, r17
+
+    ; Retorna para o setup()
+    ret
+
+; =========================================================================
+; Função: cycle()
+;  - Lê os fins de curso.
+;  - Ajusta a direção do motor (esquerda/direita) se necessário.
+;  - Seta os pinos PB0/PB1 conforme a direção.
+; =========================================================================
+cycle:
+    ; ------------------------------------------------------
+    ; Ler a variável 'direction' da RAM para um registrador
+    lds   r16, direction
+
+    ; ------------------------------------------------------
+    ; Verificar fim de curso esquerdo (EoL) em PB4
+    ; Se PB4 == 0 => fim de curso esquerdo acionado => girar p/ direita
+    in    r17, PINB           ; Ler estado do PORTB
+    sbrs  r17, PB4            ; "Skip if Bit in r17 is Set" -> se PB4=1, pula
+    rjmp  setRight            ; Se PB4=0 (bit claro), então pula para setRight
+
+    ; ------------------------------------------------------
+    ; Verificar fim de curso direito (EoR) em PD7
+    ; Se PD7 == 0 => fim de curso direito acionado => girar p/ esquerda
+    in    r17, PIND           ; Ler estado do PORTD
+    sbrs  r17, PD7            ; se PD7=1, pula
+    rjmp  setLeft             ; se PD7=0 (bit claro), então pula para setLeft
+
+    ; Se chegou aqui, nenhum fim de curso está pressionado,
+    ; então continuamos na direção atual. Pulamos para configurar saídas.
+    rjmp  updateOutputs
+
+; ----------------------------------------------------------
+; Se fim de curso esquerdo foi pressionado, muda direção p/ direita
+setRight:
+    ldi   r16, 1
+    sts   direction, r16
+    rjmp  updateOutputs
+
+; ----------------------------------------------------------
+; Se fim de curso direito foi pressionado, muda direção p/ esquerda
+setLeft:
+    ldi   r16, 0
+    sts   direction, r16
+
+; ----------------------------------------------------------
+; Atualizar as saídas PB0/PB1 de acordo com a variável direction
+updateOutputs:
+    ; Carrega 'direction' de novo para ter certeza de que está atualizada
+    lds   r16, direction
+
+    ; Precisamos manipular PB0 e PB1.
+    ; Lógica:
+    ;  direction=0 => girar p/ esquerda => PB0=0, PB1=1
+    ;  direction=1 => girar p/ direita => PB0=1, PB1=0
+
+    ; Ler PORTB num registrador (para mexer só nesses bits)
+    in    r17, PORTB
+
+    ; Primeiramente vamos colocar PB0 e PB1 em nível alto (desativados)
+    sbr   r17, (1<<PB0)|(1<<PB1)
+
+    ; Se direction=0 (esquerda), limpamos PB0 (fica 0)
+    ; Se direction=1 (direita), limpamos PB1 (fica 0)
+    tst   r16              ; Testa se r16 = 0
+    brne  dirRight         ; Se !=0, é "direita"
+dirLeft:
+    ; direction=0 => PB0=0
+    cbr   r17, (1<<PB0)
+    rjmp  writePortB
+dirRight:
+    ; direction=1 => PB1=0
+    cbr   r17, (1<<PB1)
+
+writePortB:
+    ; Escreve de volta no PORTB
+    out   PORTB, r17
+
+    ; Retorna para a função loop() do .ino
+    ret
