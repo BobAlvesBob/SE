@@ -1,6 +1,6 @@
 /**
  * Controle da Comporta com Leitura Contínua, Emergência, Sensor de Temperatura
- * e Navegação por Botão do Encoder
+ * e Sistema de Alimentação Automática
  * Sistema de Represa para Peixes
  */
 
@@ -9,6 +9,7 @@
 #include <LiquidCrystal_I2C.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <Servo.h>  // Biblioteca para o servo motor
 
 // Pinos do Joystick
 #define JOYSTICK_X A1
@@ -20,6 +21,9 @@
 // Pinos do Sensor Ultrassônico
 #define TRIGGER_PIN 11
 #define ECHO_PIN 12
+
+// Pino do Servo Motor
+#define SERVO_PIN 10
 
 // Pinos do Motor de Passo
 #define MOTOR_PIN1 2
@@ -54,13 +58,20 @@
 #define MIN_SAFE_TEMP 10.0
 #define MAX_SAFE_TEMP 30.0
 #define TEMP_CHECK_INTERVAL 2000
-#define ENCODER_DEBOUNCE 300     // Tempo de debounce para o botão do encoder (ms)
+#define ENCODER_DEBOUNCE 300
+
+// Constantes para alimentação dos peixes
+#define FEEDING_INTERVAL 30000      // Intervalo entre alimentações (30 segundos)
+#define FEEDING_DURATION 3000       // Duração da alimentação (3 segundos)
+#define SERVO_CLOSED_POS 0          // Posição do servo fechado (graus)
+#define SERVO_OPEN_POS 90           // Posição do servo aberto (graus)
 
 // Objetos
 Stepper stepperMotor(STEPS_PER_REVOLUTION, MOTOR_PIN1, MOTOR_PIN3, MOTOR_PIN2, MOTOR_PIN4);
 LiquidCrystal_I2C lcd(LCD_ADDRESS, 16, 2);
 OneWire oneWire(TEMP_SENSOR_PIN);
 DallasTemperature sensors(&oneWire);
+Servo feedingServo;                 // Novo objeto para o servo motor
 
 // Variáveis globais
 float gateHeight = 0.0;
@@ -79,26 +90,28 @@ unsigned long emergencyStartTime = 0;
 unsigned long tempAlarmStartTime = 0;
 
 // Variáveis do encoder
-int currentScreen = 0;  // 0 = Altura da comporta, 1 = Temperatura, etc.
-#define NUM_SCREENS 2   // Número total de telas disponíveis
+int currentScreen = 0;  // 0 = Altura da comporta, 1 = Temperatura, 2 = Alimentação
+#define NUM_SCREENS 3   // Número total de telas disponíveis
 
-// ATENÇÃO: Existe conflito de pinos entre os LEDs!
-// LED2 (A3) conflita com ENCODER_SW (A3)
+// Variáveis para alimentação
+unsigned long lastFeedingTime = 0;  // Último momento em que os peixes foram alimentados
+bool feedingActive = false;         // Indica se a alimentação está em andamento
+unsigned long feedingStartTime = 0; // Tempo de início da alimentação
 
 void setup() {
   Serial.begin(9600);
-  Serial.println("Sistema de Controle da Comporta - Com Navegação por Botão");
+  Serial.println("Sistema de Controle da Comporta - Com Alimentação Automatica");
   
   // Inicializa pinos do ultrassom
   pinMode(TRIGGER_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   
   // Inicializa pino do botão do encoder
-  pinMode(ENCODER_SW, INPUT_PULLUP);  // Botão do encoder com pull-up
+  pinMode(ENCODER_SW, INPUT_PULLUP);
   
-  // Inicializa os pinos dos LEDs - NOTA: Conflito de pinos
+  // Inicializa os pinos dos LEDs
   for (int i = 0; i < 8; i++) {
-    if (ledPins[i] != ENCODER_SW) {
+    if (ledPins[i] != ENCODER_SW && ledPins[i] != SERVO_PIN) {
       pinMode(ledPins[i], OUTPUT);
     }
   }
@@ -120,6 +133,13 @@ void setup() {
   
   // Define a velocidade do motor de passo
   stepperMotor.setSpeed(10);
+  
+  // Inicializa o servo motor
+  feedingServo.attach(SERVO_PIN);
+  feedingServo.write(SERVO_CLOSED_POS);  // Inicia na posição fechada
+  
+  // Inicializa a última alimentação
+  lastFeedingTime = millis();
   
   // Faz a primeira leitura do ultrassom
   readUltrasonicSensor();
@@ -150,6 +170,9 @@ void loop() {
   // Verifica o botão do encoder para mudar tela
   checkEncoderButton();
   
+  // Verifica se é hora de alimentar os peixes
+  checkFeedingTime(currentMillis);
+  
   // Lê o sensor de temperatura a cada TEMP_CHECK_INTERVAL
   if (currentMillis - lastTempRead >= TEMP_CHECK_INTERVAL) {
     readTemperature();
@@ -162,17 +185,20 @@ void loop() {
   }
   
   // Verifica o botão de emergência
-  if (!emergencyActive && !tempAlarmActive && digitalRead(PUSH_BUTTON_PIN) == LOW && currentMillis - lastButtonTime > 200) {
+  if (!emergencyActive && !tempAlarmActive && !feedingActive && digitalRead(PUSH_BUTTON_PIN) == LOW && currentMillis - lastButtonTime > 200) {
     lastButtonTime = currentMillis;
     activateEmergency();
   }
   
-  // Processa alarmes ativos
+  // Processa estados prioritários
   if (emergencyActive) {
     handleEmergency(currentMillis);
   } else if (tempAlarmActive) {
     handleTempAlarm(currentMillis);
+  } else if (feedingActive) {
+    handleFeeding(currentMillis);
   } else {
+    // Operação normal
     // Lê o sensor ultrassônico continuamente
     readUltrasonicSensor();
     
@@ -181,19 +207,66 @@ void loop() {
       handleJoystick();
       lastJoystickRead = currentMillis;
     }
+    
+    // Atualiza o display regularmente
+    if (currentMillis - lastDisplayUpdate >= 200) {
+      updateScreenContent();
+      lastDisplayUpdate = currentMillis;
+    }
   }
   
   // Atualiza os LEDs
   updateLEDs();
-  
-  // Atualiza o display regularmente
-  if (currentMillis - lastDisplayUpdate >= 200 && !emergencyActive && !tempAlarmActive) {
-    updateScreenContent();
-    lastDisplayUpdate = currentMillis;
+}
+
+// Nova função: Verifica se é hora de alimentar os peixes
+void checkFeedingTime(unsigned long currentTime) {
+  // Se não estiver já em algum estado de alarme ou alimentação
+  if (!feedingActive && !emergencyActive && !tempAlarmActive) {
+    // Verifica se o intervalo de alimentação passou
+    if (currentTime - lastFeedingTime >= FEEDING_INTERVAL) {
+      startFeeding();
+    }
   }
 }
 
-// Nova função: Verifica o botão do encoder para mudar de tela
+// Nova função: Inicia o processo de alimentação
+void startFeeding() {
+  feedingActive = true;
+  feedingStartTime = millis();
+  
+  // Abre a porta de alimentação
+  feedingServo.write(SERVO_OPEN_POS);
+  
+  // Atualiza o display
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Peixes sendo");
+  lcd.setCursor(0, 1);
+  lcd.print("alimentados!");
+  
+  Serial.println("Iniciando alimentação dos peixes");
+}
+
+// Nova função: Gerencia o processo de alimentação
+void handleFeeding(unsigned long currentTime) {
+  // Se o tempo de alimentação acabou
+  if (currentTime - feedingStartTime >= FEEDING_DURATION) {
+    // Fecha a porta de alimentação
+    feedingServo.write(SERVO_CLOSED_POS);
+    
+    // Atualiza variáveis
+    feedingActive = false;
+    lastFeedingTime = currentTime;
+    
+    // Restaura a visualização da tela atual
+    updateScreenContent();
+    
+    Serial.println("Alimentação finalizada");
+  }
+}
+
+// Verifica o botão do encoder para mudar de tela
 void checkEncoderButton() {
   // Verifica se o botão do encoder foi pressionado (com debounce)
   if (digitalRead(ENCODER_SW) == LOW) {
@@ -220,6 +293,11 @@ void checkEncoderButton() {
 
 // Atualiza o conteúdo da tela com base na tela selecionada
 void updateScreenContent() {
+  // Se estiver em alimentação, emergência ou alarme, não atualiza
+  if (feedingActive || emergencyActive || tempAlarmActive) {
+    return;
+  }
+  
   // Limpa o LCD
   lcd.clear();
   
@@ -261,8 +339,36 @@ void updateScreenContent() {
       }
       break;
       
-    // Aqui podem ser adicionadas mais telas no futuro
-    
+    case 2:  // Nova tela de alimentação
+      lcd.setCursor(0, 0);
+      lcd.print("Prox Alimentacao:");
+      
+      // Calcula o tempo até a próxima alimentação
+      unsigned long currentTimeMs = millis();
+      unsigned long timeElapsed = currentTimeMs - lastFeedingTime;
+      
+      if (timeElapsed < FEEDING_INTERVAL) {
+        // Converte para segundos e formata
+        unsigned long timeRemaining = (FEEDING_INTERVAL - timeElapsed) / 1000; // em segundos
+        unsigned long secondsRemaining = timeRemaining % 60;
+        unsigned long minutesRemaining = (timeRemaining / 60) % 60;
+        
+        lcd.setCursor(0, 1);
+        lcd.print("Em ");
+        
+        if (minutesRemaining > 0) {
+          lcd.print(minutesRemaining);
+          lcd.print("m ");
+        }
+        
+        lcd.print(secondsRemaining);
+        lcd.print("s");
+      } else {
+        lcd.setCursor(0, 1);
+        lcd.print("AGORA!");
+      }
+      break;
+      
     default:
       // Caso de erro, voltar para a primeira tela
       currentScreen = 0;
@@ -451,18 +557,18 @@ void handleJoystick() {
 
 // Atualiza os LEDs para mostrar a altura da comporta
 void updateLEDs() {
-  // Se estiver em estado de erro, emergência ou alarme de temperatura, pisque todos os LEDs
-  if (errorState || emergencyActive || tempAlarmActive) {
-    // Faz os LEDs piscarem para indicar erro/emergência
+  // Se estiver em estado de erro, emergência, alimentação ou alarme, pisque todos os LEDs
+  if (errorState || emergencyActive || tempAlarmActive || feedingActive) {
+    // Faz os LEDs piscarem
     if ((millis() / 500) % 2 == 0) {
       for (int i = 0; i < 8; i++) {
-        if (ledPins[i] != ENCODER_SW) {
+        if (ledPins[i] != ENCODER_SW && ledPins[i] != SERVO_PIN) {
           digitalWrite(ledPins[i], HIGH);
         }
       }
     } else {
       for (int i = 0; i < 8; i++) {
-        if (ledPins[i] != ENCODER_SW) {
+        if (ledPins[i] != ENCODER_SW && ledPins[i] != SERVO_PIN) {
           digitalWrite(ledPins[i], LOW);
         }
       }
@@ -476,8 +582,8 @@ void updateLEDs() {
   
   // Atualiza cada LED
   for (int i = 0; i < 8; i++) {
-    // Não mexe nos LEDs que estão compartilhando pinos com o encoder
-    if (ledPins[i] != ENCODER_SW) {
+    // Não mexe nos LEDs que estão compartilhando pinos com outros componentes
+    if (ledPins[i] != ENCODER_SW && ledPins[i] != SERVO_PIN) {
       digitalWrite(ledPins[i], (i < ledsToLight) ? HIGH : LOW);
     }
   }
