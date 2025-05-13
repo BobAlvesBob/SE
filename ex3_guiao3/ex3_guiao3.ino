@@ -1,6 +1,6 @@
 /**
  * Controle da Comporta com Leitura Contínua, Emergência, Sensor de Temperatura
- * e Navegação por Encoder
+ * e Navegação por Botão do Encoder
  * Sistema de Represa para Peixes
  */
 
@@ -14,10 +14,8 @@
 #define JOYSTICK_X A1
 #define JOYSTICK_Y A0
 
-// Pinos do Encoder (corrigidos para Arduino UNO)
-#define ENCODER_CLK 7    // Pino digital 7 (era D7)
-#define ENCODER_DT A2    // Pino analógico A2
-#define ENCODER_SW A3    // Pino analógico A3
+// Pinos do Encoder 
+#define ENCODER_SW A3    // Botão do encoder (push button)
 
 // Pinos do Sensor Ultrassônico
 #define TRIGGER_PIN 11
@@ -56,6 +54,7 @@
 #define MIN_SAFE_TEMP 10.0
 #define MAX_SAFE_TEMP 30.0
 #define TEMP_CHECK_INTERVAL 2000
+#define ENCODER_DEBOUNCE 300     // Tempo de debounce para o botão do encoder (ms)
 
 // Objetos
 Stepper stepperMotor(STEPS_PER_REVOLUTION, MOTOR_PIN1, MOTOR_PIN3, MOTOR_PIN2, MOTOR_PIN4);
@@ -74,40 +73,32 @@ unsigned long lastJoystickRead = 0;
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastTempRead = 0;
 unsigned long lastButtonTime = 0;
-unsigned long lastEncoderRead = 0;
+unsigned long lastEncoderButtonTime = 0;
 bool emergencyActive = false;
 unsigned long emergencyStartTime = 0;
 unsigned long tempAlarmStartTime = 0;
 
 // Variáveis do encoder
-int encoderPos = 0;
-int lastEncoderCLK;
 int currentScreen = 0;  // 0 = Altura da comporta, 1 = Temperatura, etc.
 #define NUM_SCREENS 2   // Número total de telas disponíveis
 
-// ATENÇÃO: Existe conflito de pinos entre o encoder e os LEDs!
-// LED1 (A2) conflita com ENCODER_DT (A2)
-// LED3 (7) conflita com ENCODER_CLK (7)
-// Para uso prático, desabilitar esses LEDs ou usar pinos diferentes
+// ATENÇÃO: Existe conflito de pinos entre os LEDs!
+// LED2 (A3) conflita com ENCODER_SW (A3)
 
 void setup() {
   Serial.begin(9600);
-  Serial.println("Sistema de Controle da Comporta - Com Navegação por Encoder");
+  Serial.println("Sistema de Controle da Comporta - Com Navegação por Botão");
   
   // Inicializa pinos do ultrassom
   pinMode(TRIGGER_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   
-  // Inicializa pinos do encoder
-  pinMode(ENCODER_CLK, INPUT);
-  pinMode(ENCODER_DT, INPUT);
+  // Inicializa pino do botão do encoder
   pinMode(ENCODER_SW, INPUT_PULLUP);  // Botão do encoder com pull-up
-  lastEncoderCLK = digitalRead(ENCODER_CLK);
   
-  // Inicializa os pinos dos LEDs - NOTA: Conflito de pinos com encoder
-  // Ajuste conforme necessário
+  // Inicializa os pinos dos LEDs - NOTA: Conflito de pinos
   for (int i = 0; i < 8; i++) {
-    if (ledPins[i] != ENCODER_CLK && ledPins[i] != ENCODER_DT && ledPins[i] != ENCODER_SW) {
+    if (ledPins[i] != ENCODER_SW) {
       pinMode(ledPins[i], OUTPUT);
     }
   }
@@ -144,7 +135,7 @@ void setup() {
   delay(1000);
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("Use o encoder");
+  lcd.print("Pressione botao");
   lcd.setCursor(0, 1);
   lcd.print("para navegar");
   delay(1500);
@@ -156,11 +147,8 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
   
-  // Lê o encoder a cada 5ms
-  if (currentMillis - lastEncoderRead >= 5) {
-    readEncoder();
-    lastEncoderRead = currentMillis;
-  }
+  // Verifica o botão do encoder para mudar tela
+  checkEncoderButton();
   
   // Lê o sensor de temperatura a cada TEMP_CHECK_INTERVAL
   if (currentMillis - lastTempRead >= TEMP_CHECK_INTERVAL) {
@@ -205,48 +193,32 @@ void loop() {
   }
 }
 
-// Nova função: Lê o encoder rotativo
-void readEncoder() {
-  // Lê o estado atual do pino CLK do encoder
-  int currentCLK = digitalRead(ENCODER_CLK);
-  
-  // Se houve uma mudança no estado do CLK (mudança de LOW para HIGH ou vice-versa)
-  if (currentCLK != lastEncoderCLK) {
-    // Se o pino DT tem um estado diferente do CLK, estamos girando no sentido horário
-    if (digitalRead(ENCODER_DT) != currentCLK) {
-      // Incrementa a posição (sentido horário)
-      encoderPos++;
-      // Muda para a próxima tela
+// Nova função: Verifica o botão do encoder para mudar de tela
+void checkEncoderButton() {
+  // Verifica se o botão do encoder foi pressionado (com debounce)
+  if (digitalRead(ENCODER_SW) == LOW) {
+    unsigned long currentTime = millis();
+    
+    // Se passou tempo suficiente desde o último clique (debounce)
+    if (currentTime - lastEncoderButtonTime > ENCODER_DEBOUNCE) {
+      lastEncoderButtonTime = currentTime;
+      
+      // Avança para a próxima tela
       currentScreen = (currentScreen + 1) % NUM_SCREENS;
       
-      Serial.print("Encoder girado no sentido horário. Tela atual: ");
+      Serial.print("Botão do encoder pressionado. Tela atual: ");
       Serial.println(currentScreen);
-    } else {
-      // Decrementa a posição (sentido anti-horário)
-      encoderPos--;
-      // Muda para a tela anterior
-      currentScreen = (currentScreen + NUM_SCREENS - 1) % NUM_SCREENS;
       
-      Serial.print("Encoder girado no sentido anti-horário. Tela atual: ");
-      Serial.println(currentScreen);
+      // Atualiza o display imediatamente com a nova tela
+      updateScreenContent();
+      
+      // Pequeno delay adicional para evitar múltiplos triggers
+      delay(50);
     }
-    
-    // Atualiza o display imediatamente com a nova tela
-    updateScreenContent();
   }
-  
-  // Verifica se o botão do encoder foi pressionado
-  if (digitalRead(ENCODER_SW) == LOW) {
-    // Função para o botão do encoder (pode ser usado para expandir funcionalidades)
-    Serial.println("Botão do encoder pressionado");
-    delay(300);  // Debounce simples
-  }
-  
-  // Salva o estado atual do CLK para a próxima comparação
-  lastEncoderCLK = currentCLK;
 }
 
-// Nova função: Atualiza o conteúdo da tela com base na tela selecionada
+// Atualiza o conteúdo da tela com base na tela selecionada
 void updateScreenContent() {
   // Limpa o LCD
   lcd.clear();
@@ -484,13 +456,13 @@ void updateLEDs() {
     // Faz os LEDs piscarem para indicar erro/emergência
     if ((millis() / 500) % 2 == 0) {
       for (int i = 0; i < 8; i++) {
-        if (ledPins[i] != ENCODER_CLK && ledPins[i] != ENCODER_DT && ledPins[i] != ENCODER_SW) {
+        if (ledPins[i] != ENCODER_SW) {
           digitalWrite(ledPins[i], HIGH);
         }
       }
     } else {
       for (int i = 0; i < 8; i++) {
-        if (ledPins[i] != ENCODER_CLK && ledPins[i] != ENCODER_DT && ledPins[i] != ENCODER_SW) {
+        if (ledPins[i] != ENCODER_SW) {
           digitalWrite(ledPins[i], LOW);
         }
       }
@@ -505,7 +477,7 @@ void updateLEDs() {
   // Atualiza cada LED
   for (int i = 0; i < 8; i++) {
     // Não mexe nos LEDs que estão compartilhando pinos com o encoder
-    if (ledPins[i] != ENCODER_CLK && ledPins[i] != ENCODER_DT && ledPins[i] != ENCODER_SW) {
+    if (ledPins[i] != ENCODER_SW) {
       digitalWrite(ledPins[i], (i < ledsToLight) ? HIGH : LOW);
     }
   }
