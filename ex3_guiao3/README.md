@@ -114,4 +114,4 @@ Executa continuamente:
 ---
 
 ## Autor
-- Projeto acadêmico para disciplina de Sistemas Embarcados (IPB) 
+- Projeto acadêmico para disciplina de Sistemas Embebidos (IPB) 
